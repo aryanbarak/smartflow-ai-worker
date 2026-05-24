@@ -43,8 +43,8 @@ function corsHeaders(request) {
     origin === ALLOWED_ORIGIN || /^http:\/\/localhost(:\d+)?$/.test(origin);
   return {
     "Access-Control-Allow-Origin": isAllowed ? origin : ALLOWED_ORIGIN,
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -57,8 +57,8 @@ function json(data, status = 200, extra = {}) {
   });
 }
 
-// Tracks request counts in KV under keys: rl:{endpoint}:{ip}:{hourBucket}.
-// Falls back to "always allow" when KV is not bound (local dev without miniflare).
+// ─── Rate limiting ─────────────────────────────────────────────────────────────
+
 async function checkRateLimit(env, ip, endpoint, limit) {
   if (!env.RATE_LIMIT_KV) return { allowed: true, remaining: limit - 1 };
 
@@ -83,6 +83,58 @@ const RATE_LIMIT_EXCEEDED = {
   message: "Rate limit exceeded. Please try again in an hour.",
   retryAfter: 3600,
 };
+
+// ─── JWT verification ──────────────────────────────────────────────────────────
+
+function base64urlDecode(str) {
+  return Uint8Array.from(
+    atob(str.replaceAll("-", "+").replaceAll("_", "/")),
+    (c) => c.codePointAt(0),
+  );
+}
+
+async function verifyJWT(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Malformed JWT");
+  const [header, payload, sig] = parts;
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    base64urlDecode(sig),
+    new TextEncoder().encode(`${header}.${payload}`),
+  );
+  if (!valid) throw new Error("Invalid JWT signature");
+
+  const claims = JSON.parse(new TextDecoder().decode(base64urlDecode(payload)));
+  if (typeof claims.exp === "number" && claims.exp < Date.now() / 1000) {
+    throw new Error("JWT expired");
+  }
+  return claims;
+}
+
+async function requireAuth(request, env) {
+  const auth = request.headers.get("Authorization") ?? "";
+  if (!auth.startsWith("Bearer ")) return { userId: null, error: "Missing authorization token" };
+  const token = auth.slice(7);
+  if (!env.SUPABASE_JWT_SECRET) return { userId: null, error: "Server misconfigured: missing JWT secret" };
+  try {
+    const claims = await verifyJWT(token, env.SUPABASE_JWT_SECRET);
+    return { userId: String(claims.sub), error: null };
+  } catch (err) {
+    return { userId: null, error: String(err) };
+  }
+}
+
+// ─── AI analyze ───────────────────────────────────────────────────────────────
 
 async function handleAnalyze(request, env) {
   const cors = corsHeaders(request);
@@ -154,6 +206,8 @@ async function handleAnalyze(request, env) {
 
   return json({ answer }, 200, headers);
 }
+
+// ─── YouTube search ────────────────────────────────────────────────────────────
 
 function parseInnertubeResults(data) {
   const items =
@@ -230,24 +284,122 @@ async function handleSearch(request, env, url) {
   return json({ results }, 200, headers);
 }
 
+// ─── Photo endpoints ───────────────────────────────────────────────────────────
+
+async function handlePhotoUpload(request, env) {
+  const cors = corsHeaders(request);
+  const { userId, error: authError } = await requireAuth(request, env);
+  if (authError) return json({ error: authError }, 401, cors);
+
+  let formData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return json({ error: "Invalid multipart body" }, 400, cors);
+  }
+
+  const file = formData.get("file");
+  const thumb = formData.get("thumb");
+  const uuid = formData.get("uuid");
+
+  if (!file || typeof file === "string") return json({ error: "file field is required" }, 400, cors);
+  if (!uuid || typeof uuid !== "string") return json({ error: "uuid field is required" }, 400, cors);
+
+  if (!env.PHOTOS_BUCKET) return json({ error: "Storage not configured" }, 500, cors);
+
+  const nameParts = file.name.split(".");
+  const ext = nameParts.length > 1 ? nameParts.pop().toLowerCase() : "bin";
+  const key = `photos/${userId}/${uuid}.${ext}`;
+  const thumbKey = `photos/${userId}/${uuid}_thumb.jpg`;
+
+  await env.PHOTOS_BUCKET.put(key, file.stream(), {
+    httpMetadata: { contentType: file.type || "application/octet-stream" },
+  });
+
+  if (thumb && typeof thumb !== "string") {
+    await env.PHOTOS_BUCKET.put(thumbKey, thumb.stream(), {
+      httpMetadata: { contentType: "image/jpeg" },
+    });
+  }
+
+  return json({ key, thumbKey }, 200, cors);
+}
+
+// Read endpoint is intentionally open (UUIDs are unguessable; no sensitive content beyond auth).
+async function handlePhotoFile(request, env, url) {
+  const cors = corsHeaders(request);
+  const key = url.searchParams.get("key");
+  if (!key) return json({ error: "key is required" }, 400, cors);
+
+  if (!env.PHOTOS_BUCKET) return json({ error: "Storage not configured" }, 500, cors);
+
+  const obj = await env.PHOTOS_BUCKET.get(key);
+  if (!obj) return json({ error: "Not found" }, 404, cors);
+
+  const headers = new Headers(cors);
+  headers.set("Content-Type", obj.httpMetadata?.contentType ?? "application/octet-stream");
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+
+  return new Response(obj.body, { status: 200, headers });
+}
+
+async function handlePhotoDelete(request, env, url) {
+  const cors = corsHeaders(request);
+  const { userId, error: authError } = await requireAuth(request, env);
+  if (authError) return json({ error: authError }, 401, cors);
+
+  const key = url.searchParams.get("key");
+  if (!key) return json({ error: "key is required" }, 400, cors);
+
+  // Verify ownership: key must be scoped to this user
+  if (!key.startsWith(`photos/${userId}/`)) {
+    return json({ error: "Forbidden" }, 403, cors);
+  }
+
+  if (!env.PHOTOS_BUCKET) return json({ error: "Storage not configured" }, 500, cors);
+
+  await env.PHOTOS_BUCKET.delete(key);
+
+  // Best-effort thumbnail deletion (no error if it doesn't exist)
+  const thumbKey = key.replace(/(\.[^.]+)?$/, "_thumb.jpg");
+  await env.PHOTOS_BUCKET.delete(thumbKey).catch(() => undefined);
+
+  return json({ ok: true }, 200, cors);
+}
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const { pathname } = url;
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
-    if (url.pathname === "/health" && request.method === "GET") {
+    if (pathname === "/health" && request.method === "GET") {
       return json({ ok: true, service: "dailyflow-ai-worker" }, 200, corsHeaders(request));
     }
 
-    if (url.pathname === "/analyze" && request.method === "POST") {
+    if (pathname === "/analyze" && request.method === "POST") {
       return handleAnalyze(request, env);
     }
 
-    if (url.pathname === "/search" && request.method === "GET") {
+    if (pathname === "/search" && request.method === "GET") {
       return handleSearch(request, env, url);
+    }
+
+    if (pathname === "/photos/upload" && request.method === "POST") {
+      return handlePhotoUpload(request, env);
+    }
+
+    if (pathname === "/photos/file" && request.method === "GET") {
+      return handlePhotoFile(request, env, url);
+    }
+
+    if (pathname === "/photos/delete" && request.method === "DELETE") {
+      return handlePhotoDelete(request, env, url);
     }
 
     return json({ error: "Not found" }, 404, corsHeaders(request));

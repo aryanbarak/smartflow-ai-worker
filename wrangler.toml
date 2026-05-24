@@ -6,10 +6,18 @@ compatibility_date = "2025-05-23"
 binding = "RATE_LIMIT_KV"
 id = "9b284a5212594011a99861750ffb9326"
 
+[[r2_buckets]]
+binding = "PHOTOS_BUCKET"
+bucket_name = "dailyflow-photos"
+
 [[routes]]
 pattern = "api.barakzai.cloud/analyze"
 zone_name = "barakzai.cloud"
 
 [[routes]]
 pattern = "api.barakzai.cloud/search"
+zone_name = "barakzai.cloud"
+
+[[routes]]
+pattern = "api.barakzai.cloud/photos/*"
 zone_name = "barakzai.cloud"
