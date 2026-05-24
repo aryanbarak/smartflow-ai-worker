@@ -1,30 +1,4 @@
 const ALLOWED_ORIGIN = "https://barakzai.cloud";
-
-const INVIDIOUS_INSTANCES = [
-  "https://inv.nadeko.net",
-  "https://invidious.nerdvpn.de",
-  "https://invidious.privacyredirect.com",
-];
-
-async function fetchInvidiousSearch(query) {
-  for (const base of INVIDIOUS_INSTANCES) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(
-        `${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video&page=1`,
-        { signal: controller.signal },
-      );
-      clearTimeout(timeoutId);
-      if (!res.ok) continue;
-      const data = await res.json();
-      return data.filter((v) => v.type === "video");
-    } catch {
-      // try next instance
-    }
-  }
-  return null;
-}
 const GEMINI_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
@@ -56,28 +30,21 @@ const LANGUAGE_INSTRUCTIONS = {
 
 function buildSystemInstruction(mode, language) {
   const modePrompt = SYSTEM_PROMPTS[mode] ?? SYSTEM_PROMPTS.general_it;
-  const langInstruction = LANGUAGE_INSTRUCTIONS[language] ?? "Detect the language from the message and respond in the same language.";
+  const langInstruction =
+    LANGUAGE_INSTRUCTIONS[language] ??
+    "Detect the language from the message and respond in the same language.";
   return `${modePrompt}\n\n${langInstruction}`;
 }
 
+// Allows barakzai.cloud in production and localhost on any port for development.
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
-  return {
-    "Access-Control-Allow-Origin": origin === ALLOWED_ORIGIN ? ALLOWED_ORIGIN : ALLOWED_ORIGIN,
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Max-Age": "86400",
-    Vary: "Origin",
-  };
-}
-
-function searchCorsHeaders(request) {
-  const origin = request.headers.get("Origin") || "";
-  const isAllowed = origin === ALLOWED_ORIGIN || /^http:\/\/localhost(:\d+)?$/.test(origin);
+  const isAllowed =
+    origin === ALLOWED_ORIGIN || /^http:\/\/localhost(:\d+)?$/.test(origin);
   return {
     "Access-Control-Allow-Origin": isAllowed ? origin : ALLOWED_ORIGIN,
     "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -86,10 +53,7 @@ function searchCorsHeaders(request) {
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...extra,
-    },
+    headers: { "Content-Type": "application/json; charset=utf-8", ...extra },
   });
 }
 
@@ -156,16 +120,70 @@ async function handleAnalyze(request, env) {
   return json({ answer }, 200, cors);
 }
 
+function parseInnertubeResults(data) {
+  const items =
+    data?.contents?.twoColumnSearchResultsRenderer
+      ?.primaryContents?.sectionListRenderer
+      ?.contents?.[0]?.itemSectionRenderer?.contents ?? [];
+
+  return items
+    .filter((item) => item.videoRenderer)
+    .map((item) => {
+      const v = item.videoRenderer;
+      const title =
+        v.title?.runs?.[0]?.text ??
+        v.title?.accessibility?.accessibilityData?.label ??
+        "";
+      const author = v.ownerText?.runs?.[0]?.text ?? "";
+      const durationText = v.lengthText?.simpleText ?? "";
+      const viewText =
+        v.viewCountText?.simpleText ?? v.viewCountText?.runs?.[0]?.text ?? "0";
+
+      const parts = durationText.split(":").map(Number);
+      let lengthSeconds = 0;
+      if (parts.length === 3) lengthSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+      else if (parts.length === 2) lengthSeconds = parts[0] * 60 + parts[1];
+
+      const viewCount = Number.parseInt(viewText.replace(/\D/g, ""), 10) || 0;
+
+      return { type: "video", videoId: v.videoId, title, author, lengthSeconds, viewCount };
+    });
+}
+
 async function handleSearch(request, url) {
-  const cors = searchCorsHeaders(request);
+  const cors = corsHeaders(request);
   const q = url.searchParams.get("q");
-  if (!q?.trim()) {
-    return json({ error: "q is required" }, 400, cors);
+  if (!q) return json({ error: "q is required" }, 400, cors);
+
+  let ytResponse;
+  try {
+    ytResponse = await fetch(
+      "https://www.youtube.com/youtubei/v1/search",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          context: { client: { clientName: "WEB", clientVersion: "2.20250101.00.00" } },
+          query: q,
+        }),
+        signal: AbortSignal.timeout(10000),
+      },
+    );
+  } catch (err) {
+    return json({ error: "Search unavailable", detail: String(err) }, 503, cors);
   }
-  const results = await fetchInvidiousSearch(q.trim());
-  if (results === null) {
-    return json({ error: "All search instances unavailable" }, 503, cors);
+
+  if (!ytResponse.ok) {
+    return json({ error: "Search unavailable", status: ytResponse.status }, 503, cors);
   }
+
+  const data = await ytResponse.json();
+  const results = parseInnertubeResults(data);
+
+  if (results.length === 0) {
+    return json({ error: "No results found" }, 503, cors);
+  }
+
   return json({ results }, 200, cors);
 }
 
