@@ -1,0 +1,7 @@
+name = "dailyflow-ai-worker"
+main = "src/index.js"
+compatibility_date = "2025-05-23"
+
+[[routes]]
+pattern = "api.barakzai.cloud/analyze"
+zone_name = "barakzai.cloud"
