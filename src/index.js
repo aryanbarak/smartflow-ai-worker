@@ -57,6 +57,33 @@ function json(data, status = 200, extra = {}) {
   });
 }
 
+// Tracks request counts in KV under keys: rl:{endpoint}:{ip}:{hourBucket}.
+// Falls back to "always allow" when KV is not bound (local dev without miniflare).
+async function checkRateLimit(env, ip, endpoint, limit) {
+  if (!env.RATE_LIMIT_KV) return { allowed: true, remaining: limit - 1 };
+
+  const key = `rl:${endpoint}:${ip}:${Math.floor(Date.now() / 3_600_000)}`;
+  const current = Number.parseInt((await env.RATE_LIMIT_KV.get(key)) ?? "0", 10);
+
+  if (current >= limit) return { allowed: false, remaining: 0 };
+
+  await env.RATE_LIMIT_KV.put(key, String(current + 1), { expirationTtl: 3600 });
+  return { allowed: true, remaining: limit - current - 1 };
+}
+
+function rlHeaders(limit, remaining) {
+  return {
+    "X-RateLimit-Limit": String(limit),
+    "X-RateLimit-Remaining": String(remaining),
+  };
+}
+
+const RATE_LIMIT_EXCEEDED = {
+  error: "Too many requests",
+  message: "Rate limit exceeded. Please try again in an hour.",
+  retryAfter: 3600,
+};
+
 async function handleAnalyze(request, env) {
   const cors = corsHeaders(request);
 
@@ -65,21 +92,29 @@ async function handleAnalyze(request, env) {
     return json({ error: "Forbidden origin" }, 403, cors);
   }
 
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRateLimit(env, ip, "analyze", 20);
+  const headers = { ...cors, ...rlHeaders(20, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
+
   let body;
   try {
     body = await request.json();
   } catch {
-    return json({ error: "Invalid JSON body" }, 400, cors);
+    return json({ error: "Invalid JSON body" }, 400, headers);
   }
 
   const { message, history = [], mode, language } = body;
 
   if (!message || typeof message !== "string" || !message.trim()) {
-    return json({ error: "message is required and must be a non-empty string" }, 400, cors);
+    return json({ error: "message is required and must be a non-empty string" }, 400, headers);
   }
 
   if (!env.GEMINI_API_KEY) {
-    return json({ error: "GEMINI_API_KEY is not configured" }, 500, cors);
+    return json({ error: "GEMINI_API_KEY is not configured" }, 500, headers);
   }
 
   const systemInstruction = buildSystemInstruction(mode, language);
@@ -106,18 +141,18 @@ async function handleAnalyze(request, env) {
       }),
     });
   } catch (err) {
-    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, cors);
+    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
   }
 
   if (!geminiResponse.ok) {
     const detail = await geminiResponse.text().catch(() => "(unreadable)");
-    return json({ error: "Gemini API error", status: geminiResponse.status, detail }, 502, cors);
+    return json({ error: "Gemini API error", status: geminiResponse.status, detail }, 502, headers);
   }
 
   const geminiData = await geminiResponse.json();
   const answer = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-  return json({ answer }, 200, cors);
+  return json({ answer }, 200, headers);
 }
 
 function parseInnertubeResults(data) {
@@ -150,10 +185,18 @@ function parseInnertubeResults(data) {
     });
 }
 
-async function handleSearch(request, url) {
+async function handleSearch(request, env, url) {
   const cors = corsHeaders(request);
   const q = url.searchParams.get("q");
   if (!q) return json({ error: "q is required" }, 400, cors);
+
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRateLimit(env, ip, "search", 60);
+  const headers = { ...cors, ...rlHeaders(60, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
 
   let ytResponse;
   try {
@@ -170,21 +213,21 @@ async function handleSearch(request, url) {
       },
     );
   } catch (err) {
-    return json({ error: "Search unavailable", detail: String(err) }, 503, cors);
+    return json({ error: "Search unavailable", detail: String(err) }, 503, headers);
   }
 
   if (!ytResponse.ok) {
-    return json({ error: "Search unavailable", status: ytResponse.status }, 503, cors);
+    return json({ error: "Search unavailable", status: ytResponse.status }, 503, headers);
   }
 
   const data = await ytResponse.json();
   const results = parseInnertubeResults(data);
 
   if (results.length === 0) {
-    return json({ error: "No results found" }, 503, cors);
+    return json({ error: "No results found" }, 503, headers);
   }
 
-  return json({ results }, 200, cors);
+  return json({ results }, 200, headers);
 }
 
 export default {
@@ -204,7 +247,7 @@ export default {
     }
 
     if (url.pathname === "/search" && request.method === "GET") {
-      return handleSearch(request, url);
+      return handleSearch(request, env, url);
     }
 
     return json({ error: "Not found" }, 404, corsHeaders(request));

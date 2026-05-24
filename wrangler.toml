@@ -2,6 +2,10 @@ name = "dailyflow-ai-worker"
 main = "src/index.js"
 compatibility_date = "2025-05-23"
 
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "9b284a5212594011a99861750ffb9326"
+
 [[routes]]
 pattern = "api.barakzai.cloud/analyze"
 zone_name = "barakzai.cloud"
