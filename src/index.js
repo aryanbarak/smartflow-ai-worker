@@ -344,6 +344,99 @@ async function handlePhotoDelete(request, env, url) {
   return json({ ok: true }, 200, cors);
 }
 
+async function handlePhotoAnalyze(request, env) {
+  const cors = corsHeaders(request);
+  const { userId, error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRateLimit(env, ip, "photo-analyze", 10);
+  const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400, headers);
+  }
+
+  const { key } = body;
+  if (!key || typeof key !== "string") {
+    return json({ error: "key is required" }, 400, headers);
+  }
+
+  if (!key.startsWith(`photos/${userId}/`)) {
+    return json({ error: "Forbidden" }, 403, headers);
+  }
+
+  if (!env.PHOTOS_BUCKET) return json({ error: "Storage not configured" }, 500, headers);
+  if (!env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY not configured" }, 500, headers);
+
+  const obj = await env.PHOTOS_BUCKET.get(key);
+  if (!obj) return json({ error: "Photo not found" }, 404, headers);
+
+  const bytes = await obj.arrayBuffer();
+  const arr = new Uint8Array(bytes);
+  let str = "";
+  const chunk = 8192;
+  for (let i = 0; i < arr.length; i += chunk) {
+    str += String.fromCodePoint(...arr.subarray(i, i + chunk));
+  }
+  const base64 = btoa(str);
+  const mimeType = obj.httpMetadata?.contentType ?? "image/jpeg";
+
+  const prompt =
+    'Analyze this photo. Respond with JSON only (no markdown fence):\n' +
+    '{"description":"one sentence","tags":["tag1","tag2"],"people_count":0}\n' +
+    'Rules: tags are 3-8 lowercase words/phrases for objects, setting, activity, mood. ' +
+    'people_count is number of visible people (0 if none).';
+
+  let geminiRes;
+  try {
+    geminiRes = await fetch(`${GEMINI_ENDPOINT}?key=${env.GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [
+            { inline_data: { mime_type: mimeType, data: base64 } },
+            { text: prompt },
+          ],
+        }],
+        generationConfig: { responseMimeType: "application/json" },
+      }),
+    });
+  } catch (err) {
+    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
+  }
+
+  if (!geminiRes.ok) {
+    const detail = await geminiRes.text().catch(() => "(unreadable)");
+    return json({ error: "Gemini API error", status: geminiRes.status, detail }, 502, headers);
+  }
+
+  const geminiData = await geminiRes.json();
+  const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch {
+    result = {};
+  }
+
+  return json({
+    description: typeof result.description === "string" ? result.description : "",
+    tags: Array.isArray(result.tags) ? result.tags.filter((t) => typeof t === "string") : [],
+    people_count: typeof result.people_count === "number" ? result.people_count : 0,
+  }, 200, headers);
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export default {
@@ -377,6 +470,10 @@ export default {
 
     if (pathname === "/photos/delete" && request.method === "DELETE") {
       return handlePhotoDelete(request, env, url);
+    }
+
+    if (pathname === "/photos/analyze" && request.method === "POST") {
+      return handlePhotoAnalyze(request, env);
     }
 
     return json({ error: "Not found" }, 404, corsHeaders(request));
