@@ -1,74 +1,52 @@
 # dailyflow-ai-worker
 
-Cloudflare Worker that proxies requests from the dailyFlow frontend to the Google Gemini API.
+Cloudflare Worker API for connecting the DailyFlow frontend with Google Gemini AI.
 
-## What it does
+This worker acts as a secure proxy between the frontend application and the Gemini API.  
+It handles CORS, receives AI requests from `barakzai.cloud`, forwards the conversation to Gemini 2.5 Flash and returns a structured answer to the frontend.
 
-- Receives `POST /analyze` requests from `https://barakzai.cloud`
-- Enforces CORS — only requests from `https://barakzai.cloud` are accepted
-- Forwards the message + conversation history to Gemini 2.5 Flash
-- Returns `{ answer: string }` to the frontend
+## Features
+
+- Secure API proxy for Gemini AI
+- CORS protection for `https://barakzai.cloud`
+- `/analyze` endpoint for AI requests
+- `/health` endpoint for availability checks
+- JSON-based request and response handling
+- Deployed as a Cloudflare Worker
+
+## Tech Stack
+
+- JavaScript
+- Cloudflare Workers
+- Google Gemini API
+- REST API
+- CORS
 
 ## Endpoints
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `POST` | `/analyze` | Origin check | Send message, get AI answer |
-| `GET` | `/health` | None | Health check |
-
-### Request body (`POST /analyze`)
+| Method | Path | Auth / Protection | Description |
+|---|---|---|---|
+| `POST` | `/analyze` | Origin check | Sends a message to Gemini and returns an AI response |
+| `GET` | `/health` | None | Health check endpoint |
+## Request Example
 
 ```json
 {
-  "message": "What is a binary search tree?",
-  "history": [
-    { "role": "user", "content": "Hello" },
-    { "role": "assistant", "content": "Hi! How can I help?" }
-  ]
+  "message": "Explain normalization in databases",
+  "conversation": []
 }
 ```
 
-### Response
+## Response Example
 
 ```json
-{ "answer": "A binary search tree is..." }
+{
+  "answer": "Normalization is a database design process..."
+}
 ```
 
-## Deploy
+## Related Project
 
-```bash
-npm install
-npx wrangler deploy
-```
+This worker is used by the DailyFlow web application:
 
-## Required secrets
-
-Set the Gemini API key as a Cloudflare Worker secret (never commit it):
-
-```bash
-npx wrangler secret put GEMINI_API_KEY
-```
-
-## Route
-
-The Worker is bound to:
-
-```
-api.barakzai.cloud/analyze
-```
-
-Configured in `wrangler.toml`:
-
-```toml
-[[routes]]
-pattern = "api.barakzai.cloud/analyze"
-zone_name = "barakzai.cloud"
-```
-
-## Local development
-
-```bash
-npx wrangler dev
-```
-
-Note: CORS is locked to `https://barakzai.cloud` in production. During local dev the Worker runs on `localhost:8787`.
+https://barakzai.cloud
