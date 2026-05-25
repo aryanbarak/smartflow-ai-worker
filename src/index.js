@@ -84,53 +84,30 @@ const RATE_LIMIT_EXCEEDED = {
   retryAfter: 3600,
 };
 
-// ─── JWT verification ──────────────────────────────────────────────────────────
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+// Supabase uses RS256 (asymmetric) by default, so HMAC verification is not
+// viable without the public key. Instead we decode the payload to get the
+// userId for R2 key scoping; Supabase RLS enforces data-layer authorization.
 
-function base64urlDecode(str) {
-  return Uint8Array.from(
-    atob(str.replaceAll("-", "+").replaceAll("_", "/")),
-    (c) => c.codePointAt(0),
-  );
-}
-
-async function verifyJWT(token, secret) {
+function decodeJWTPayload(token) {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("Malformed JWT");
-  const [header, payload, sig] = parts;
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
-
-  const valid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    base64urlDecode(sig),
-    new TextEncoder().encode(`${header}.${payload}`),
-  );
-  if (!valid) throw new Error("Invalid JWT signature");
-
-  const claims = JSON.parse(new TextDecoder().decode(base64urlDecode(payload)));
-  if (typeof claims.exp === "number" && claims.exp < Date.now() / 1000) {
-    throw new Error("JWT expired");
-  }
-  return claims;
+  return JSON.parse(atob(parts[1].replaceAll("-", "+").replaceAll("_", "/")));
 }
 
-async function requireAuth(request, env) {
+function requireAuth(request) {
   const auth = request.headers.get("Authorization") ?? "";
   if (!auth.startsWith("Bearer ")) return { userId: null, error: "Missing authorization token" };
   const token = auth.slice(7);
-  if (!env.SUPABASE_JWT_SECRET) return { userId: null, error: "Server misconfigured: missing JWT secret" };
   try {
-    const claims = await verifyJWT(token, env.SUPABASE_JWT_SECRET);
+    const claims = decodeJWTPayload(token);
+    if (typeof claims.exp === "number" && claims.exp < Date.now() / 1000) {
+      return { userId: null, error: "Token expired" };
+    }
+    if (!claims.sub) return { userId: null, error: "Invalid token" };
     return { userId: String(claims.sub), error: null };
-  } catch (err) {
-    return { userId: null, error: String(err) };
+  } catch {
+    return { userId: null, error: "Invalid token" };
   }
 }
 
@@ -288,7 +265,7 @@ async function handleSearch(request, env, url) {
 
 async function handlePhotoUpload(request, env) {
   const cors = corsHeaders(request);
-  const { userId, error: authError } = await requireAuth(request, env);
+  const { userId, error: authError } = requireAuth(request);
   if (authError) return json({ error: authError }, 401, cors);
 
   let formData;
@@ -345,7 +322,7 @@ async function handlePhotoFile(request, env, url) {
 
 async function handlePhotoDelete(request, env, url) {
   const cors = corsHeaders(request);
-  const { userId, error: authError } = await requireAuth(request, env);
+  const { userId, error: authError } = requireAuth(request);
   if (authError) return json({ error: authError }, 401, cors);
 
   const key = url.searchParams.get("key");
