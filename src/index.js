@@ -437,6 +437,228 @@ async function handlePhotoAnalyze(request, env) {
   }, 200, headers);
 }
 
+// ─── OCR (Gemini Vision) ──────────────────────────────────────────────────────
+
+async function fileToBase64(file) {
+  const bytes = await file.arrayBuffer();
+  const arr = new Uint8Array(bytes);
+  let str = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < arr.length; i += chunkSize) {
+    str += String.fromCodePoint(...arr.subarray(i, i + chunkSize));
+  }
+  return btoa(str);
+}
+
+function buildOcrPrompt(language) {
+  const langNames = { de: "German", en: "English", fa: "Persian (Farsi)" };
+  const langHint = langNames[language] ?? String(language);
+  return (
+    `Extract all text from this document. Primary language hint: ${langHint}. ` +
+    "Return ONLY the extracted text, preserving paragraphs and line breaks. " +
+    "Do not add commentary, headers, or explanations."
+  );
+}
+
+async function handleOcr(request, env) {
+  const cors = corsHeaders(request);
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRateLimit(env, ip, "ocr", 10);
+  const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
+
+  if (!env.GEMINI_API_KEY) {
+    return json({ error: "GEMINI_API_KEY is not configured" }, 500, headers);
+  }
+
+  let formData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return json({ error: "Invalid multipart body" }, 400, headers);
+  }
+
+  const file = formData.get("file");
+  const language = formData.get("language") ?? "en";
+
+  if (!file || typeof file === "string") {
+    return json({ error: "file field is required" }, 400, headers);
+  }
+
+  if (file.size > 15 * 1024 * 1024) {
+    return json({ error: "File too large (max 15 MB)" }, 413, headers);
+  }
+
+  const base64 = await fileToBase64(file);
+  const prompt = buildOcrPrompt(language);
+
+  let geminiRes;
+  try {
+    geminiRes = await fetch(`${GEMINI_ENDPOINT}?key=${env.GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [
+            { inline_data: { mime_type: file.type || "application/octet-stream", data: base64 } },
+            { text: prompt },
+          ],
+        }],
+      }),
+    });
+  } catch (err) {
+    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
+  }
+
+  if (!geminiRes.ok) {
+    const detail = await geminiRes.text().catch(() => "(unreadable)");
+    return json({ error: "Gemini API error", status: geminiRes.status, detail }, 502, headers);
+  }
+
+  const geminiData = await geminiRes.json();
+  const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+  return json({ text }, 200, headers);
+}
+
+// ─── ElevenLabs TTS ───────────────────────────────────────────────────────────
+
+function ttsTextError(text) {
+  if (!text || typeof text !== "string" || !text.trim()) return "text is required";
+  if (text.length > 3000) return "Text too long (max 3,000 characters)";
+  return null;
+}
+
+async function callElevenLabs(apiKey, text, voiceId) {
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${String(voiceId)}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text: text.trim(),
+        model_id: "eleven_multilingual_v2",
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
+    }
+  );
+  return res;
+}
+
+async function handleTts(request, env) {
+  const cors = corsHeaders(request);
+
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRateLimit(env, ip, "tts", 10);
+  const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
+  if (!env.ELEVENLABS_API_KEY) {
+    return json({ error: "ELEVENLABS_API_KEY is not configured" }, 500, cors);
+  }
+
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: "Invalid JSON body" }, 400, cors); }
+
+  const { text, voiceId = "pNInz6obpgDQGcFmaJgB" } = body;
+  const textErr = ttsTextError(text);
+  if (textErr) return json({ error: textErr }, 400, cors);
+
+  let ttsRes;
+  try { ttsRes = await callElevenLabs(env.ELEVENLABS_API_KEY, text, voiceId); }
+  catch (err) { return json({ error: "Failed to reach ElevenLabs API", detail: String(err) }, 502, cors); }
+
+  if (!ttsRes.ok) {
+    const detail = await ttsRes.text().catch(() => "(unreadable)");
+    return json({ error: "ElevenLabs API error", status: ttsRes.status, detail }, 502, cors);
+  }
+
+  return new Response(ttsRes.body, {
+    status: 200,
+    headers: { "Content-Type": "audio/mpeg", "Content-Disposition": 'inline; filename="audio.mp3"', ...cors },
+  });
+}
+
+// ─── DeepL Translation ────────────────────────────────────────────────────────
+
+const DEEPL_LANGS = { fa: "FA", de: "DE", en: "EN-GB" };
+
+async function callDeepL(apiKey, text, targetLang, sourceLang) {
+  const body = { text: [text.slice(0, 50000)], target_lang: DEEPL_LANGS[targetLang] ?? "DE" };
+  if (sourceLang) body.source_lang = DEEPL_LANGS[sourceLang];
+
+  const res = await fetch("https://api-free.deepl.com/v2/translate", {
+    method: "POST",
+    headers: { "Authorization": `DeepL-Auth-Key ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "(unreadable)");
+    throw Object.assign(new Error("DeepL API error"), { status: res.status, detail });
+  }
+
+  const data = await res.json();
+  return {
+    translated: data.translations?.[0]?.text ?? "",
+    detected_source: data.translations?.[0]?.detected_source_language ?? null,
+  };
+}
+
+async function handleTranslate(request, env) {
+  const cors = corsHeaders(request);
+
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const rl = await checkRateLimit(env, ip, "translate", 30);
+  const headers = { ...cors, ...rlHeaders(30, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400, headers);
+  }
+
+  const { text, targetLang, sourceLang } = body;
+
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return json({ error: "text is required" }, 400, headers);
+  }
+  if (!targetLang) {
+    return json({ error: "targetLang is required" }, 400, headers);
+  }
+  if (!env.DEEPL_API_KEY) {
+    return json({ error: "DEEPL_API_KEY is not configured" }, 500, headers);
+  }
+
+  try {
+    const result = await callDeepL(env.DEEPL_API_KEY, text, targetLang, sourceLang);
+    return json(result, 200, headers);
+  } catch (err) {
+    const status = err.status ?? 502;
+    const detail = err.detail ?? String(err);
+    return json({ error: err.message, status, detail }, 502, headers);
+  }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export default {
@@ -474,6 +696,18 @@ export default {
 
     if (pathname === "/photos/analyze" && request.method === "POST") {
       return handlePhotoAnalyze(request, env);
+    }
+
+    if (pathname === "/translate" && request.method === "POST") {
+      return handleTranslate(request, env);
+    }
+
+    if (pathname === "/ocr" && request.method === "POST") {
+      return handleOcr(request, env);
+    }
+
+    if (pathname === "/tts" && request.method === "POST") {
+      return handleTts(request, env);
     }
 
     return json({ error: "Not found" }, 404, corsHeaders(request));

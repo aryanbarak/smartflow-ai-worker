@@ -21,3 +21,15 @@ zone_name = "barakzai.cloud"
 [[routes]]
 pattern = "api.barakzai.cloud/photos/*"
 zone_name = "barakzai.cloud"
+
+[[routes]]
+pattern = "api.barakzai.cloud/translate"
+zone_name = "barakzai.cloud"
+
+[[routes]]
+pattern = "api.barakzai.cloud/ocr"
+zone_name = "barakzai.cloud"
+
+[[routes]]
+pattern = "api.barakzai.cloud/tts"
+zone_name = "barakzai.cloud"
