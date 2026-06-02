@@ -566,7 +566,9 @@ async function handleTts(request, env) {
   if (!rl.allowed) {
     return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
   }
-  if (!env.ELEVENLABS_API_KEY) {
+  // Trim to guard against trailing newline from wrangler secret piping
+  const elevenKey = (env.ELEVENLABS_API_KEY ?? "").trim();
+  if (!elevenKey) {
     return json({ error: "ELEVENLABS_API_KEY is not configured" }, 500, cors);
   }
 
@@ -579,7 +581,7 @@ async function handleTts(request, env) {
   if (textErr) return json({ error: textErr }, 400, cors);
 
   let ttsRes;
-  try { ttsRes = await callElevenLabs(env.ELEVENLABS_API_KEY, text, voiceId); }
+  try { ttsRes = await callElevenLabs(elevenKey, text, voiceId); }
   catch (err) { return json({ error: "Failed to reach ElevenLabs API", detail: String(err) }, 502, cors); }
 
   if (!ttsRes.ok) {
