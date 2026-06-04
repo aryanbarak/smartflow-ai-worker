@@ -59,10 +59,22 @@ function json(data, status = 200, extra = {}) {
 
 // ─── Rate limiting ─────────────────────────────────────────────────────────────
 
-async function checkRateLimit(env, ip, endpoint, limit) {
+// Returns user_id from JWT sub claim when present, falls back to CF IP.
+function getIdentifier(request) {
+  const auth = request.headers.get("Authorization") ?? "";
+  if (auth.startsWith("Bearer ")) {
+    try {
+      const payload = JSON.parse(atob(auth.slice(7).split(".")[1].replaceAll("-", "+").replaceAll("_", "/")));
+      if (payload.sub) return `u:${String(payload.sub)}`;
+    } catch { /* fall through */ }
+  }
+  return `ip:${request.headers.get("CF-Connecting-IP") ?? "unknown"}`;
+}
+
+async function checkRateLimit(env, identifier, endpoint, limit) {
   if (!env.RATE_LIMIT_KV) return { allowed: true, remaining: limit - 1 };
 
-  const key = `rl:${endpoint}:${ip}:${Math.floor(Date.now() / 3_600_000)}`;
+  const key = `rl:${endpoint}:${identifier}:${Math.floor(Date.now() / 3_600_000)}`;
   const current = Number.parseInt((await env.RATE_LIMIT_KV.get(key)) ?? "0", 10);
 
   if (current >= limit) return { allowed: false, remaining: 0 };
@@ -121,8 +133,8 @@ async function handleAnalyze(request, env) {
     return json({ error: "Forbidden origin" }, 403, cors);
   }
 
-  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRateLimit(env, ip, "analyze", 20);
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "analyze", 20);
   const headers = { ...cors, ...rlHeaders(20, rl.remaining) };
 
   if (!rl.allowed) {
@@ -221,8 +233,8 @@ async function handleSearch(request, env, url) {
   const q = url.searchParams.get("q");
   if (!q) return json({ error: "q is required" }, 400, cors);
 
-  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRateLimit(env, ip, "search", 60);
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "search", 60);
   const headers = { ...cors, ...rlHeaders(60, rl.remaining) };
 
   if (!rl.allowed) {
@@ -349,8 +361,8 @@ async function handlePhotoAnalyze(request, env) {
   const { userId, error: authError } = requireAuth(request);
   if (authError) return json({ error: authError }, 401, cors);
 
-  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRateLimit(env, ip, "photo-analyze", 10);
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "photo-analyze", 10);
   const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
 
   if (!rl.allowed) {
@@ -465,8 +477,8 @@ async function handleOcr(request, env) {
   const { error: authError } = requireAuth(request);
   if (authError) return json({ error: authError }, 401, cors);
 
-  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRateLimit(env, ip, "ocr", 10);
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "ocr", 10);
   const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
 
   if (!rl.allowed) {
@@ -536,7 +548,7 @@ function ttsTextError(text) {
   return null;
 }
 
-async function callElevenLabs(apiKey, text, voiceId) {
+async function callElevenLabs(apiKey, text, voiceId, modelId) {
   const res = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${String(voiceId)}`,
     {
@@ -548,7 +560,7 @@ async function callElevenLabs(apiKey, text, voiceId) {
       },
       body: JSON.stringify({
         text: text.trim(),
-        model_id: "eleven_multilingual_v2",
+        model_id: modelId || "eleven_v3",
         voice_settings: { stability: 0.5, similarity_boost: 0.75 },
       }),
     }
@@ -559,8 +571,8 @@ async function callElevenLabs(apiKey, text, voiceId) {
 async function handleTts(request, env) {
   const cors = corsHeaders(request);
 
-  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRateLimit(env, ip, "tts", 10);
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "tts", 10);
   const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
 
   if (!rl.allowed) {
@@ -576,12 +588,17 @@ async function handleTts(request, env) {
   try { body = await request.json(); }
   catch { return json({ error: "Invalid JSON body" }, 400, cors); }
 
-  const { text, voiceId = "pNInz6obpgDQGcFmaJgB" } = body;
+  const { text, voiceId = "pNInz6obpgDQGcFmaJgB", modelId = "eleven_v3" } = body;
   const textErr = ttsTextError(text);
   if (textErr) return json({ error: textErr }, 400, cors);
 
+  return fetchAndStreamAudio(elevenKey, text, voiceId, modelId, cors);
+}
+
+// Extracted to keep handleTts under the cognitive-complexity limit.
+async function fetchAndStreamAudio(elevenKey, text, voiceId, modelId, cors) {
   let ttsRes;
-  try { ttsRes = await callElevenLabs(elevenKey, text, voiceId); }
+  try { ttsRes = await callElevenLabs(elevenKey, text, voiceId, modelId); }
   catch (err) { return json({ error: "Failed to reach ElevenLabs API", detail: String(err) }, 502, cors); }
 
   if (!ttsRes.ok) {
@@ -589,7 +606,9 @@ async function handleTts(request, env) {
     return json({ error: "ElevenLabs API error", status: ttsRes.status, detail }, 502, cors);
   }
 
-  return new Response(ttsRes.body, {
+  // Buffer fully before responding — avoids binary-streaming CORS issues in browsers.
+  const audioBuffer = await ttsRes.arrayBuffer();
+  return new Response(audioBuffer, {
     status: 200,
     headers: { "Content-Type": "audio/mpeg", "Content-Disposition": 'inline; filename="audio.mp3"', ...cors },
   });
@@ -624,8 +643,8 @@ async function callDeepL(apiKey, text, targetLang, sourceLang) {
 async function handleTranslate(request, env) {
   const cors = corsHeaders(request);
 
-  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
-  const rl = await checkRateLimit(env, ip, "translate", 30);
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "translate", 30);
   const headers = { ...cors, ...rlHeaders(30, rl.remaining) };
 
   if (!rl.allowed) {
