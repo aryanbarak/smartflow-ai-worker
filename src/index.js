@@ -1,6 +1,50 @@
 const ALLOWED_ORIGIN = "https://barakzai.cloud";
-const GEMINI_ENDPOINT =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+// ─── AI Gateway — provider list (tried in order) ──────────────────────────────
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const AI_PROVIDERS = [
+  { name: "gemini-2.5-flash", model: "gemini-2.5-flash" },
+  { name: "gemini-1.5-flash", model: "gemini-1.5-flash" },
+];
+
+/**
+ * Calls Gemini with automatic fallback.
+ * Tries each provider in AI_PROVIDERS order; retries next on 429 or 5xx.
+ * @param {object} requestBody  Full Gemini generateContent request body.
+ * @param {string} apiKey
+ * @returns {{ res: Response, provider: string, model: string }}
+ */
+async function callGeminiWithFallback(requestBody, apiKey) {
+  let lastError = null;
+  for (const provider of AI_PROVIDERS) {
+    const url = `${GEMINI_BASE}/${provider.model}:generateContent?key=${apiKey}`;
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+    } catch (err) {
+      lastError = err;
+      console.log(`[AI Gateway] ${provider.name} unreachable: ${err.message}`);
+      continue;
+    }
+    if (res.status === 429 || res.status >= 500) {
+      const errData = await res.json().catch(() => ({}));
+      lastError = new Error(`${provider.name}: HTTP ${res.status} — ${errData.error?.message ?? "Unknown"}`);
+      console.log(`[AI Gateway] ${provider.name} failed (${res.status}), trying next...`);
+      continue;
+    }
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(`${provider.name}: ${errData.error?.message ?? "Request failed"}`);
+    }
+    console.log(`[AI Gateway] Success with ${provider.name}`);
+    return { res, provider: provider.name, model: provider.model };
+  }
+  throw new Error(`All AI providers failed. Last error: ${lastError?.message}`);
+}
 
 const SYSTEM_PROMPTS = {
   fiae_algorithms:
@@ -171,29 +215,23 @@ async function handleAnalyze(request, env) {
     { role: "user", parts: [{ text: message.trim() }] },
   ];
 
-  let geminiResponse;
+  let geminiResult;
   try {
-    geminiResponse = await fetch(`${GEMINI_ENDPOINT}?key=${env.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemInstruction }] },
-        contents,
-      }),
-    });
+    geminiResult = await callGeminiWithFallback({
+      system_instruction: { parts: [{ text: systemInstruction }] },
+      contents,
+    }, env.GEMINI_API_KEY);
   } catch (err) {
     return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
   }
 
-  if (!geminiResponse.ok) {
-    const detail = await geminiResponse.text().catch(() => "(unreadable)");
-    return json({ error: "Gemini API error", status: geminiResponse.status, detail }, 502, headers);
-  }
-
-  const geminiData = await geminiResponse.json();
+  const geminiData = await geminiResult.res.json();
   const answer = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-  return json({ answer }, 200, headers);
+  return json({ answer, provider: geminiResult.provider, model: geminiResult.model }, 200, {
+    ...headers,
+    "X-AI-Provider": geminiResult.provider,
+  });
 }
 
 // ─── YouTube search ────────────────────────────────────────────────────────────
@@ -407,32 +445,23 @@ async function handlePhotoAnalyze(request, env) {
     'Rules: tags are 3-8 lowercase words/phrases for objects, setting, activity, mood. ' +
     'people_count is number of visible people (0 if none).';
 
-  let geminiRes;
+  let geminiResult;
   try {
-    geminiRes = await fetch(`${GEMINI_ENDPOINT}?key=${env.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{
-          role: "user",
-          parts: [
-            { inline_data: { mime_type: mimeType, data: base64 } },
-            { text: prompt },
-          ],
-        }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    });
+    geminiResult = await callGeminiWithFallback({
+      contents: [{
+        role: "user",
+        parts: [
+          { inline_data: { mime_type: mimeType, data: base64 } },
+          { text: prompt },
+        ],
+      }],
+      generationConfig: { responseMimeType: "application/json" },
+    }, env.GEMINI_API_KEY);
   } catch (err) {
     return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
   }
 
-  if (!geminiRes.ok) {
-    const detail = await geminiRes.text().catch(() => "(unreadable)");
-    return json({ error: "Gemini API error", status: geminiRes.status, detail }, 502, headers);
-  }
-
-  const geminiData = await geminiRes.json();
+  const geminiData = await geminiResult.res.json();
   const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
 
   let result;
@@ -510,31 +539,22 @@ async function handleOcr(request, env) {
   const base64 = await fileToBase64(file);
   const prompt = buildOcrPrompt(language);
 
-  let geminiRes;
+  let geminiResult;
   try {
-    geminiRes = await fetch(`${GEMINI_ENDPOINT}?key=${env.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{
-          role: "user",
-          parts: [
-            { inline_data: { mime_type: file.type || "application/octet-stream", data: base64 } },
-            { text: prompt },
-          ],
-        }],
-      }),
-    });
+    geminiResult = await callGeminiWithFallback({
+      contents: [{
+        role: "user",
+        parts: [
+          { inline_data: { mime_type: file.type || "application/octet-stream", data: base64 } },
+          { text: prompt },
+        ],
+      }],
+    }, env.GEMINI_API_KEY);
   } catch (err) {
     return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
   }
 
-  if (!geminiRes.ok) {
-    const detail = await geminiRes.text().catch(() => "(unreadable)");
-    return json({ error: "Gemini API error", status: geminiRes.status, detail }, 502, headers);
-  }
-
-  const geminiData = await geminiRes.json();
+  const geminiData = await geminiResult.res.json();
   const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
   return json({ text }, 200, headers);
