@@ -192,7 +192,7 @@ async function handleAnalyze(request, env) {
     return json({ error: "Invalid JSON body" }, 400, headers);
   }
 
-  const { message, history = [], mode, language } = body;
+  const { message, history = [], mode, language, memoryContext = "" } = body;
 
   if (!message || typeof message !== "string" || !message.trim()) {
     return json({ error: "message is required and must be a non-empty string" }, 400, headers);
@@ -202,7 +202,8 @@ async function handleAnalyze(request, env) {
     return json({ error: "GEMINI_API_KEY is not configured" }, 500, headers);
   }
 
-  const systemInstruction = buildSystemInstruction(mode, language);
+  const systemInstruction = buildSystemInstruction(mode, language)
+    + (memoryContext ? `\n\n${memoryContext}` : "");
 
   // Accepts both "assistant" (OpenAI-style) and "model" (Gemini-native) role names.
   const contents = [
@@ -730,7 +731,7 @@ async function handleBriefing(request, env) {
     return json({ error: "GEMINI_API_KEY is not configured" }, 500, cors);
   }
 
-  const { data, language = "en" } = body;
+  const { data, language = "en", memoryContext = "" } = body;
   const langInstructions = {
     en: "Respond in English.",
     de: "Antworte auf Deutsch.",
@@ -738,7 +739,7 @@ async function handleBriefing(request, env) {
   };
 
   const prompt = `You are a personal life assistant analyzing weekly data for the user.
-${langInstructions[language] ?? langInstructions.en}
+${langInstructions[language] ?? langInstructions.en}${memoryContext ? `\n${memoryContext}` : ""}
 
 Here is the user's data for this week:
 
