@@ -893,7 +893,17 @@ Return ONLY valid JSON, no markdown, no explanation:
 
   let parsed;
   try {
-    const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    // More robust JSON extraction
+    let clean = text.trim();
+    // Remove markdown code blocks
+    clean = clean.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+    // Find JSON object boundaries
+    const jsonStart = clean.indexOf("{");
+    const jsonEnd = clean.lastIndexOf("}");
+    if (jsonStart === -1 || jsonEnd === -1) {
+      throw new Error(`No JSON found in response. Raw: ${clean.slice(0, 200)}`);
+    }
+    clean = clean.slice(jsonStart, jsonEnd + 1);
     parsed = JSON.parse(clean);
   } catch {
     return json({ error: "Failed to parse AI response", raw: text.slice(0, 500) }, 502, headers);
