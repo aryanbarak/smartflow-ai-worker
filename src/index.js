@@ -795,6 +795,113 @@ Use markdown formatting. Be concise but insightful. Maximum 400 words total.
   }
 }
 
+// ─── Import Bank Statement ────────────────────────────────────────────────────
+
+async function handleImportBank(request, env) {
+  const cors = corsHeaders(request);
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
+  const identifier = getIdentifier(request);
+  const rl = await checkRateLimit(env, identifier, "import-bank", 10);
+  const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
+
+  if (!rl.allowed) {
+    return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
+  }
+
+  if (!env.GEMINI_API_KEY) {
+    return json({ error: "GEMINI_API_KEY is not configured" }, 500, headers);
+  }
+
+  let formData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return json({ error: "Invalid multipart body" }, 400, headers);
+  }
+
+  const file = formData.get("file");
+  if (!file || typeof file === "string") {
+    return json({ error: "No file provided" }, 400, headers);
+  }
+
+  if (file.size > 20 * 1024 * 1024) {
+    return json({ error: "File too large (max 20 MB)" }, 413, headers);
+  }
+
+  const base64 = await fileToBase64(file);
+
+  const prompt = `You are analyzing a German bank statement (Sparkasse or similar).
+Extract ALL transactions from this PDF bank statement.
+
+For each transaction, extract:
+- date: in ISO format YYYY-MM-DD (convert from DD.MM.YYYY)
+- description: the Erläuterung/description field (keep original German text, max 100 chars)
+- amount: numeric value (negative = expense, positive = income)
+- type: "income" if amount > 0, "expense" if amount < 0
+- category: auto-categorize based on description:
+  * "Rent" — Miete, Warmmiete, Kaltmiete, Wohnung
+  * "Food" — REWE, EDEKA, Lidl, Aldi, Netto, Penny, dm, Rossmann, Restaurant, Bäckerei, Supermarkt
+  * "Transport" — HVV, DB, Deutsche Bahn, Uber, Tank, Benzin, ÖPNV, Bus, Bahn
+  * "Health" — Apotheke, Arzt, Krankenhaus, AOK, TK, DAK
+  * "Insurance" — Versicherung, Allianz, HUK, ADAC
+  * "Utilities" — Strom, Gas, Wasser, Internet, Telekom, Vodafone, O2
+  * "Shopping" — Amazon, Zalando, Otto, PayPal purchases
+  * "Entertainment" — Netflix, Spotify, Disney, YouTube, Apple
+  * "Salary" — Gehalt, Lohn, Gutschrift vom Arbeitgeber
+  * "Transfer" — Überweisung, Gutschrift (between own accounts)
+  * "Other" — anything else
+
+Return ONLY valid JSON, no markdown, no explanation:
+{
+  "transactions": [
+    {
+      "date": "2026-03-11",
+      "description": "Telekom Deutschland GmbH",
+      "amount": -37.90,
+      "type": "expense",
+      "category": "Utilities"
+    }
+  ],
+  "account_holder": "name if visible",
+  "statement_period": "2026-03-01 to 2026-03-31",
+  "opening_balance": 0,
+  "closing_balance": 0
+}`;
+
+  let geminiResult;
+  try {
+    geminiResult = await callGeminiWithFallback(
+      {
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: "application/pdf", data: base64 } },
+          ],
+        }],
+        generationConfig: { maxOutputTokens: 4096, temperature: 0.1 },
+      },
+      env.GEMINI_API_KEY,
+    );
+  } catch (err) {
+    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
+  }
+
+  const geminiData = await geminiResult.res.json();
+  const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+  let parsed;
+  try {
+    const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    parsed = JSON.parse(clean);
+  } catch {
+    return json({ error: "Failed to parse AI response", raw: text.slice(0, 500) }, 502, headers);
+  }
+
+  return json({ ...parsed, provider: geminiResult.provider }, 200, headers);
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export default {
@@ -848,6 +955,10 @@ export default {
 
     if (pathname === "/briefing" && request.method === "POST") {
       return handleBriefing(request, env);
+    }
+
+    if (pathname === "/import-bank" && request.method === "POST") {
+      return handleImportBank(request, env);
     }
 
     return json({ error: "Not found" }, 404, corsHeaders(request));
