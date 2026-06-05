@@ -591,6 +591,9 @@ async function callElevenLabs(apiKey, text, voiceId, modelId) {
 async function handleTts(request, env) {
   const cors = corsHeaders(request);
 
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
   const identifier = getIdentifier(request);
   const rl = await checkRateLimit(env, identifier, "tts", 10);
   const headers = { ...cors, ...rlHeaders(10, rl.remaining) };
@@ -663,6 +666,9 @@ async function callDeepL(apiKey, text, targetLang, sourceLang) {
 async function handleTranslate(request, env) {
   const cors = corsHeaders(request);
 
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
   const identifier = getIdentifier(request);
   const rl = await checkRateLimit(env, identifier, "translate", 30);
   const headers = { ...cors, ...rlHeaders(30, rl.remaining) };
@@ -704,6 +710,10 @@ async function handleTranslate(request, env) {
 
 async function handleBriefing(request, env) {
   const cors = corsHeaders(request);
+
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
   const identifier = getIdentifier(request);
   const rl = await checkRateLimit(env, identifier, "briefing", 5);
   if (!rl.allowed) {
@@ -875,12 +885,13 @@ Return ONLY valid JSON, no markdown, no explanation:
     geminiResult = await callGeminiWithFallback(
       {
         contents: [{
+          role: "user",
           parts: [
-            { text: prompt },
             { inline_data: { mime_type: "application/pdf", data: base64 } },
+            { text: prompt },
           ],
         }],
-        generationConfig: { maxOutputTokens: 4096, temperature: 0.1 },
+        generationConfig: { maxOutputTokens: 16384, temperature: 0.1 },
       },
       env.GEMINI_API_KEY,
     );
@@ -889,24 +900,44 @@ Return ONLY valid JSON, no markdown, no explanation:
   }
 
   const geminiData = await geminiResult.res.json();
-  const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const candidate = geminiData.candidates?.[0];
+  const finishReason = candidate?.finishReason ?? "UNKNOWN";
+  const text = candidate?.content?.parts?.[0]?.text ?? "";
+  console.log('[import-bank] finishReason:', finishReason, '| text length:', text.length);
+  console.log('[import-bank] Raw Gemini response (first 500 chars):', text.slice(0, 500));
+
+  if (!text) {
+    console.log('[import-bank] Empty text — full geminiData:', JSON.stringify(geminiData).slice(0, 1000));
+    return json({ error: "Gemini returned empty response", finishReason, raw: JSON.stringify(geminiData).slice(0, 500) }, 502, headers);
+  }
+
+  if (finishReason === "MAX_TOKENS") {
+    console.log('[import-bank] Response truncated (MAX_TOKENS) — last 200:', text.slice(-200));
+    return json({ error: "Response truncated — too many transactions. Try a shorter date range.", finishReason }, 502, headers);
+  }
 
   let parsed;
   try {
-    // More robust JSON extraction
-    let clean = text.trim();
-    // Remove markdown code blocks
-    clean = clean.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    // Find JSON object boundaries
-    const jsonStart = clean.indexOf("{");
-    const jsonEnd = clean.lastIndexOf("}");
-    if (jsonStart === -1 || jsonEnd === -1) {
-      throw new Error(`No JSON found in response. Raw: ${clean.slice(0, 200)}`);
+    // Extract JSON from response
+    let jsonStr = text.trim();
+    // Remove ALL variations of markdown code blocks
+    jsonStr = jsonStr.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+    // Find JSON boundaries as backup
+    const start = jsonStr.indexOf("{");
+    const end = jsonStr.lastIndexOf("}");
+    if (start !== -1 && end !== -1) {
+      jsonStr = jsonStr.slice(start, end + 1);
     }
-    clean = clean.slice(jsonStart, jsonEnd + 1);
-    parsed = JSON.parse(clean);
-  } catch {
-    return json({ error: "Failed to parse AI response", raw: text.slice(0, 500) }, 502, headers);
+    console.log('[import-bank] Cleaned JSON (first 200):', jsonStr.slice(0, 200));
+    console.log('[import-bank] Cleaned JSON (last 200):', jsonStr.slice(-200));
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch (parseErr) {
+      console.log('[import-bank] Parse error:', parseErr.message);
+      throw new Error(`JSON parse failed: ${parseErr.message}`);
+    }
+  } catch (err) {
+    return json({ error: "Failed to parse AI response", detail: String(err), raw: text.slice(0, 500) }, 502, headers);
   }
 
   return json({ ...parsed, provider: geminiResult.provider }, 200, headers);
