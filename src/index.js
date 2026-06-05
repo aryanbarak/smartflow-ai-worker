@@ -556,9 +556,58 @@ async function handleOcr(request, env) {
   }
 
   const geminiData = await geminiResult.res.json();
-  const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const extractedText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-  return json({ text }, 200, headers);
+  // Second pass: generate summary + action items from extracted text
+  let summary = null;
+  if (extractedText.trim().length > 50) {
+    const summaryPrompt = `You are analyzing a document for the person who uploaded it.
+Language hint: ${language}. Respond in the same language as the document content.
+
+Generate a structured analysis. Return ONLY valid JSON, no markdown:
+{
+  "title": "document title (short)",
+  "summary": "2-3 sentence summary",
+  "key_points": ["point 1", "point 2", "point 3"],
+  "action_items": [
+    {
+      "title": "action the document owner should take",
+      "reason": "why this action matters",
+      "priority": "low|medium|high"
+    }
+  ]
+}
+
+IMPORTANT: Action items are for the DOCUMENT OWNER/UPLOADER only.
+Not for external parties, companies, or recipients.
+Maximum 5 action items.
+
+Document text:
+${extractedText.slice(0, 8000)}`;
+
+    try {
+      const summaryResult = await callGeminiWithFallback(
+        {
+          contents: [{ parts: [{ text: summaryPrompt }] }],
+          generationConfig: { maxOutputTokens: 1024, temperature: 0.3 },
+        },
+        env.GEMINI_API_KEY,
+      );
+      const summaryData = await summaryResult.res.json();
+      const summaryText = summaryData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+      let cleanSummary = summaryText.trim()
+        .replace(/^```json\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+      const start = cleanSummary.indexOf("{");
+      const end = cleanSummary.lastIndexOf("}");
+      if (start !== -1 && end !== -1) cleanSummary = cleanSummary.slice(start, end + 1);
+      summary = JSON.parse(cleanSummary);
+    } catch {
+      console.log("[ocr] summary parse failed, returning text only");
+    }
+  }
+
+  return json({ text: extractedText, characters: extractedText.length, summary, provider: geminiResult.provider }, 200, headers);
 }
 
 // ─── ElevenLabs TTS ───────────────────────────────────────────────────────────
