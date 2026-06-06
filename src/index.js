@@ -4,7 +4,7 @@ const ALLOWED_ORIGIN = "https://barakzai.cloud";
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const AI_PROVIDERS = [
   { name: "gemini-2.5-flash", model: "gemini-2.5-flash" },
-  { name: "gemini-1.5-flash", model: "gemini-1.5-flash" },
+  { name: "gemini-2.0-flash", model: "gemini-2.0-flash" },
 ];
 
 /**
@@ -481,6 +481,37 @@ async function handlePhotoAnalyze(request, env) {
 
 // ─── OCR (Gemini Vision) ──────────────────────────────────────────────────────
 
+// Extracts the first complete JSON object from LLM output that may be wrapped
+// in markdown fences. Uses bracket counting so } inside strings is ignored.
+function extractJsonObject(text) {
+  // Strip markdown code fences if present
+  const clean = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < clean.length; i++) {
+    const c = clean[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\" && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        return JSON.parse(clean.slice(start, i + 1));
+      }
+    }
+  }
+  throw new Error("No complete JSON object found in response");
+}
+
 async function fileToBase64(file) {
   const bytes = await file.arrayBuffer();
   const arr = new Uint8Array(bytes);
@@ -537,6 +568,8 @@ async function handleOcr(request, env) {
     return json({ error: "File too large (max 15 MB)" }, 413, headers);
   }
 
+  console.log("[ocr] file received:", file.name ?? "unknown", file.size, "bytes, lang:", language);
+
   const base64 = await fileToBase64(file);
   const prompt = buildOcrPrompt(language);
 
@@ -550,17 +583,31 @@ async function handleOcr(request, env) {
           { text: prompt },
         ],
       }],
+      generationConfig: { maxOutputTokens: 4096, temperature: 0.1 },
     }, env.GEMINI_API_KEY);
   } catch (err) {
-    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
+    console.log("[ocr] callGeminiWithFallback threw:", String(err));
+    return json({ error: "Failed to reach Gemini API", detail: String(err).slice(0, 200) }, 502, headers);
+  }
+
+  if (!geminiResult?.res) {
+    return json({ error: "No response from Gemini" }, 502, headers);
+  }
+
+  if (!geminiResult.res.ok) {
+    const errText = await geminiResult.res.text().catch(() => "");
+    console.log("[ocr] Gemini OCR not ok:", geminiResult.res.status, errText.slice(0, 200));
+    return json({ error: `Gemini API error: ${geminiResult.res.status}`, detail: errText.slice(0, 200) }, 502, headers);
   }
 
   const geminiData = await geminiResult.res.json();
   const extractedText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  console.log("[ocr] OCR text length:", extractedText.length);
 
   // Second pass: generate summary + action items from extracted text
   let summary = null;
   if (extractedText.trim().length > 50) {
+    console.log("[ocr] starting summary generation...");
     const summaryPrompt = `You are analyzing a document for the person who uploaded it.
 Language hint: ${language}. Respond in the same language as the document content.
 
@@ -583,27 +630,30 @@ Not for external parties, companies, or recipients.
 Maximum 5 action items.
 
 Document text:
-${extractedText.slice(0, 8000)}`;
+${extractedText.slice(0, 3000)}`;
 
+    let summaryText = "";
     try {
       const summaryResult = await callGeminiWithFallback(
         {
           contents: [{ parts: [{ text: summaryPrompt }] }],
-          generationConfig: { maxOutputTokens: 1024, temperature: 0.3 },
+          generationConfig: { maxOutputTokens: 2048, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
         },
         env.GEMINI_API_KEY,
       );
+      if (!summaryResult.res.ok) {
+        throw new Error(`Summary Gemini failed: ${summaryResult.res.status}`);
+      }
       const summaryData = await summaryResult.res.json();
-      const summaryText = summaryData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
-      let cleanSummary = summaryText.trim()
-        .replace(/^```json\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-      const start = cleanSummary.indexOf("{");
-      const end = cleanSummary.lastIndexOf("}");
-      if (start !== -1 && end !== -1) cleanSummary = cleanSummary.slice(start, end + 1);
-      summary = JSON.parse(cleanSummary);
-    } catch {
-      console.log("[ocr] summary parse failed, returning text only");
+      const candidate = summaryData.candidates?.[0];
+      console.log("[ocr] summary finishReason:", candidate?.finishReason);
+      summaryText = candidate?.content?.parts?.[0]?.text ?? "";
+      console.log("[ocr] summaryText length:", summaryText.length);
+      summary = extractJsonObject(summaryText);
+      console.log("[ocr] summary generated successfully");
+    } catch (err) {
+      console.log("[ocr] summary parse failed. raw text:", summaryText.slice(0, 500));
+      console.log("[ocr] summary error:", String(err));
     }
   }
 
