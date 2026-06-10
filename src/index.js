@@ -169,18 +169,25 @@ function requireAuth(request) {
 
 // ─── AI analyze ───────────────────────────────────────────────────────────────
 
+function buildAnalyzeUserParts(message, fileData) {
+  const parts = [];
+  if (fileData?.base64 && fileData?.mimeType) {
+    parts.push({ inline_data: { mime_type: fileData.mimeType, data: fileData.base64 } });
+    if (fileData.name) parts.push({ text: `[File: ${fileData.name}]\n` });
+  }
+  parts.push({ text: message || "Please analyze the attached file." });
+  return parts;
+}
+
 async function handleAnalyze(request, env) {
   const cors = corsHeaders(request);
 
-  const origin = request.headers.get("Origin");
-  if (origin !== ALLOWED_ORIGIN) {
-    return json({ error: "Forbidden origin" }, 403, cors);
-  }
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
 
   const identifier = getIdentifier(request);
-  const rl = await checkRateLimit(env, identifier, "analyze", 20);
-  const headers = { ...cors, ...rlHeaders(20, rl.remaining) };
-
+  const rl = await checkRateLimit(env, identifier, "analyze", 30);
+  const headers = { ...cors, ...rlHeaders(30, rl.remaining) };
   if (!rl.allowed) {
     return json(RATE_LIMIT_EXCEEDED, 429, { ...headers, "Retry-After": "3600" });
   }
@@ -189,50 +196,64 @@ async function handleAnalyze(request, env) {
   try {
     body = await request.json();
   } catch {
-    return json({ error: "Invalid JSON body" }, 400, headers);
+    return json({ detail: "Invalid JSON body" }, 400, headers);
   }
 
-  const { message, history = [], mode, language, memoryContext = "" } = body;
+  const message   = typeof body.message       === "string" ? body.message.trim() : "";
+  const history   = Array.isArray(body.history)            ? body.history         : [];
+  const mode      = typeof body.mode          === "string" ? body.mode            : "general_it";
+  const language  = typeof body.language      === "string" ? body.language        : "de";
+  const memoryCtx = typeof body.memoryContext === "string" ? body.memoryContext   : "";
+  const fileData  = body.fileData ?? null;
 
-  if (!message || typeof message !== "string" || !message.trim()) {
-    return json({ error: "message is required and must be a non-empty string" }, 400, headers);
+  if (!message && !fileData) {
+    return json({ detail: "message or fileData is required" }, 400, headers);
   }
 
   if (!env.GEMINI_API_KEY) {
     return json({ error: "GEMINI_API_KEY is not configured" }, 500, headers);
   }
 
-  const systemInstruction = buildSystemInstruction(mode, language)
-    + (memoryContext ? `\n\n${memoryContext}` : "");
+  const systemInstruction = buildSystemInstruction(mode, language);
+  const fullSystemText = memoryCtx
+    ? `${systemInstruction}\n\nUser context:\n${memoryCtx}`
+    : systemInstruction;
 
-  // Accepts both "assistant" (OpenAI-style) and "model" (Gemini-native) role names.
-  const contents = [
-    ...history
-      .filter((m) => m && typeof m.content === "string" && m.content.trim())
-      .map((m) => ({
-        role: m.role === "assistant" || m.role === "model" ? "model" : "user",
-        parts: [{ text: m.content.trim() }],
-      })),
-    { role: "user", parts: [{ text: message.trim() }] },
-  ];
+  const geminiHistory = history.map((h) => ({
+    role: h.role === "assistant" ? "model" : "user",
+    parts: [{ text: h.content }],
+  }));
+
+  const geminiBody = {
+    system_instruction: { parts: [{ text: fullSystemText }] },
+    contents: [
+      ...geminiHistory,
+      { role: "user", parts: buildAnalyzeUserParts(message, fileData) },
+    ],
+    generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
+  };
 
   let geminiResult;
   try {
-    geminiResult = await callGeminiWithFallback({
-      system_instruction: { parts: [{ text: systemInstruction }] },
-      contents,
-    }, env.GEMINI_API_KEY);
+    geminiResult = await callGeminiWithFallback(geminiBody, env.GEMINI_API_KEY); // NOSONAR
   } catch (err) {
-    return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
+    return json(
+      { error: "Failed to reach Gemini API", detail: String(err).slice(0, 200) },
+      502,
+      headers
+    );
   }
 
   const geminiData = await geminiResult.res.json();
-  const answer = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const answer =
+    geminiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ??
+    "No response from AI.";
 
-  return json({ answer, provider: geminiResult.provider, model: geminiResult.model }, 200, {
-    ...headers,
-    "X-AI-Provider": geminiResult.provider,
-  });
+  return json(
+    { answer, provider: geminiResult.provider },
+    200,
+    { ...headers, "X-AI-Provider": geminiResult.provider }
+  );
 }
 
 // ─── YouTube search ────────────────────────────────────────────────────────────
@@ -891,7 +912,7 @@ Use markdown formatting. Be concise but insightful. Maximum 400 words total.
 
   try {
     const result = await callGeminiWithFallback(
-      { contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 1024, temperature: 0.7 } },
+      { contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 2048, temperature: 0.7, thinkingConfig: { thinkingBudget: 0 } } },
       env.GEMINI_API_KEY,
     );
     const geminiData = await result.res.json();
