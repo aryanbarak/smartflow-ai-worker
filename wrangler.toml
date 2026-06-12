@@ -10,6 +10,9 @@ id = "9b284a5212594011a99861750ffb9326"
 binding = "PHOTOS_BUCKET"
 bucket_name = "dailyflow-photos"
 
+[ai]
+binding = "AI"
+
 [[routes]]
 pattern = "api.barakzai.cloud/analyze"
 zone_name = "barakzai.cloud"

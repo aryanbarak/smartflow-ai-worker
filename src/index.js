@@ -1,23 +1,69 @@
 const ALLOWED_ORIGIN = "https://barakzai.cloud";
 
 // ─── AI Gateway — provider list (tried in order) ──────────────────────────────
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_DIRECT_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const AI_PROVIDERS = [
   { name: "gemini-2.5-flash", model: "gemini-2.5-flash" },
   { name: "gemini-2.0-flash", model: "gemini-2.0-flash" },
 ];
 
+// When CF_ACCOUNT_ID + CF_GATEWAY_NAME are set, Gemini calls are routed through
+// Cloudflare AI Gateway (analytics, caching, rate-limit dashboard, provider logs).
+function geminiBase(env) {
+  if (env?.CF_ACCOUNT_ID && env?.CF_GATEWAY_NAME) {
+    return `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.CF_GATEWAY_NAME}/google-ai-studio/v1beta/models`;
+  }
+  return GEMINI_DIRECT_BASE;
+}
+
+// Last-resort fallback: Cloudflare Workers AI (free, built-in, no API key needed).
+// Translates the Gemini request shape into the Workers AI messages format.
+// Note: file attachments (inline_data) cannot be forwarded — text-only.
+async function callWorkersAI(requestBody, env) {
+  if (!env?.AI) throw new Error("Workers AI binding not available");
+
+  const systemText = requestBody.system_instruction?.parts?.[0]?.text ?? "";
+  const messages = [];
+  if (systemText) messages.push({ role: "system", content: systemText });
+
+  for (const turn of requestBody.contents ?? []) {
+    const role = turn.role === "model" ? "assistant" : "user";
+    const text = turn.parts?.map((p) => p.text ?? "").join("") ?? "";
+    if (text) messages.push({ role, content: text });
+  }
+
+  const maxTokens = requestBody.generationConfig?.maxOutputTokens ?? 2048;
+  const temperature = requestBody.generationConfig?.temperature ?? 0.7;
+
+  console.log("[AI Gateway] Falling back to Workers AI");
+  const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+    messages,
+    max_tokens: maxTokens,
+    temperature,
+  });
+
+  const text = result?.response ?? "";
+  const fakeRes = new Response(
+    JSON.stringify({ candidates: [{ content: { parts: [{ text }] } }] }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+  return { res: fakeRes, provider: "workers-ai-llama-3.1-8b", model: "llama-3.1-8b" };
+}
+
 /**
- * Calls Gemini with automatic fallback.
+ * Calls Gemini with automatic fallback, optionally via CF AI Gateway.
  * Tries each provider in AI_PROVIDERS order; retries next on 429 or 5xx.
+ * Falls back to Cloudflare Workers AI when all Gemini providers fail.
  * @param {object} requestBody  Full Gemini generateContent request body.
  * @param {string} apiKey
+ * @param {object} env          Cloudflare Worker env (for gateway config + Workers AI).
  * @returns {{ res: Response, provider: string, model: string }}
  */
-async function callGeminiWithFallback(requestBody, apiKey) {
+async function callGeminiWithFallback(requestBody, apiKey, env) {
+  const base = geminiBase(env);
   let lastError = null;
   for (const provider of AI_PROVIDERS) {
-    const url = `${GEMINI_BASE}/${provider.model}:generateContent?key=${apiKey}`;
+    const url = `${base}/${provider.model}:generateContent?key=${apiKey}`;
     let res;
     try {
       res = await fetch(url, {
@@ -43,7 +89,13 @@ async function callGeminiWithFallback(requestBody, apiKey) {
     console.log(`[AI Gateway] Success with ${provider.name}`);
     return { res, provider: provider.name, model: provider.model };
   }
-  throw new Error(`All AI providers failed. Last error: ${lastError?.message}`);
+
+  // All Gemini variants failed — try Cloudflare Workers AI as last resort.
+  try {
+    return await callWorkersAI(requestBody, env);
+  } catch (workerErr) {
+    throw new Error(`All AI providers failed. Last error: ${lastError?.message ?? workerErr.message}`);
+  }
 }
 
 const SYSTEM_PROMPTS = {
@@ -235,7 +287,7 @@ async function handleAnalyze(request, env) {
 
   let geminiResult;
   try {
-    geminiResult = await callGeminiWithFallback(geminiBody, env.GEMINI_API_KEY); // NOSONAR
+    geminiResult = await callGeminiWithFallback(geminiBody, env.GEMINI_API_KEY, env); // NOSONAR
   } catch (err) {
     return json(
       { error: "Failed to reach Gemini API", detail: String(err).slice(0, 200) },
@@ -469,7 +521,7 @@ async function handlePhotoAnalyze(request, env) {
 
   let geminiResult;
   try {
-    geminiResult = await callGeminiWithFallback({
+    geminiResult = await callGeminiWithFallback({ // NOSONAR
       contents: [{
         role: "user",
         parts: [
@@ -478,7 +530,7 @@ async function handlePhotoAnalyze(request, env) {
         ],
       }],
       generationConfig: { responseMimeType: "application/json" },
-    }, env.GEMINI_API_KEY);
+    }, env.GEMINI_API_KEY, env);
   } catch (err) {
     return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
   }
@@ -502,35 +554,37 @@ async function handlePhotoAnalyze(request, env) {
 
 // ─── OCR (Gemini Vision) ──────────────────────────────────────────────────────
 
-// Extracts the first complete JSON object from LLM output that may be wrapped
-// in markdown fences. Uses bracket counting so } inside strings is ignored.
-function extractJsonObject(text) {
-  // Strip markdown code fences if present
-  const clean = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+function stripMarkdownFence(text) {
+  return text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+}
 
+// Returns the index of the closing `}` that matches the `{` at `start`,
+// accounting for string literals and escape sequences.
+function findJsonEnd(clean, start) {
   let depth = 0;
-  let start = -1;
   let inString = false;
   let escape = false;
-
-  for (let i = 0; i < clean.length; i++) {
+  for (let i = start; i < clean.length; i++) {
     const c = clean[i];
     if (escape) { escape = false; continue; }
     if (c === "\\" && inString) { escape = true; continue; }
     if (c === '"') { inString = !inString; continue; }
     if (inString) continue;
-
-    if (c === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (c === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        return JSON.parse(clean.slice(start, i + 1));
-      }
-    }
+    if (c === "{") { depth++; continue; }
+    if (c === "}" && --depth === 0) return i;
   }
-  throw new Error("No complete JSON object found in response");
+  return -1;
+}
+
+// Extracts the first complete JSON object from LLM output that may be wrapped
+// in markdown fences.
+function extractJsonObject(text) {
+  const clean = stripMarkdownFence(text);
+  const start = clean.indexOf("{");
+  if (start === -1) throw new Error("No complete JSON object found in response");
+  const end = findJsonEnd(clean, start);
+  if (end === -1) throw new Error("No complete JSON object found in response");
+  return JSON.parse(clean.slice(start, end + 1));
 }
 
 async function fileToBase64(file) {
@@ -596,7 +650,7 @@ async function handleOcr(request, env) {
 
   let geminiResult;
   try {
-    geminiResult = await callGeminiWithFallback({
+    geminiResult = await callGeminiWithFallback({ // NOSONAR
       contents: [{
         role: "user",
         parts: [
@@ -605,7 +659,7 @@ async function handleOcr(request, env) {
         ],
       }],
       generationConfig: { maxOutputTokens: 4096, temperature: 0.1 },
-    }, env.GEMINI_API_KEY);
+    }, env.GEMINI_API_KEY, env);
   } catch (err) {
     console.log("[ocr] callGeminiWithFallback threw:", String(err));
     return json({ error: "Failed to reach Gemini API", detail: String(err).slice(0, 200) }, 502, headers);
@@ -655,12 +709,13 @@ ${extractedText.slice(0, 3000)}`;
 
     let summaryText = "";
     try {
-      const summaryResult = await callGeminiWithFallback(
+      const summaryResult = await callGeminiWithFallback( // NOSONAR
         {
           contents: [{ parts: [{ text: summaryPrompt }] }],
           generationConfig: { maxOutputTokens: 2048, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
         },
         env.GEMINI_API_KEY,
+        env,
       );
       if (!summaryResult.res.ok) {
         throw new Error(`Summary Gemini failed: ${summaryResult.res.status}`);
@@ -911,9 +966,10 @@ Use markdown formatting. Be concise but insightful. Maximum 400 words total.
 [3 specific actionable recommendations for this week]`;
 
   try {
-    const result = await callGeminiWithFallback(
+    const result = await callGeminiWithFallback( // NOSONAR
       { contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 2048, temperature: 0.7, thinkingConfig: { thinkingBudget: 0 } } },
       env.GEMINI_API_KEY,
+      env,
     );
     const geminiData = await result.res.json();
     const briefing = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
@@ -1003,7 +1059,7 @@ Return ONLY valid JSON, no markdown, no explanation:
 
   let geminiResult;
   try {
-    geminiResult = await callGeminiWithFallback(
+    geminiResult = await callGeminiWithFallback( // NOSONAR
       {
         contents: [{
           role: "user",
@@ -1015,6 +1071,7 @@ Return ONLY valid JSON, no markdown, no explanation:
         generationConfig: { maxOutputTokens: 16384, temperature: 0.1 },
       },
       env.GEMINI_API_KEY,
+      env,
     );
   } catch (err) {
     return json({ error: "Failed to reach Gemini API", detail: String(err) }, 502, headers);
