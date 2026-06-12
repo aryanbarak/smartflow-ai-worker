@@ -813,6 +813,78 @@ async function fetchAndStreamAudio(elevenKey, text, voiceId, modelId, cors) {
   });
 }
 
+// ─── Azure Neural TTS ─────────────────────────────────────────────────────────
+
+const AZURE_VOICES = { de: "de-DE-KatjaNeural", fa: "fa-IR-DilaraNeural" };
+const AZURE_LOCALES = { de: "de-DE", fa: "fa-IR" };
+
+function escapeXml(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+async function handleTtsAzure(request, env) {
+  const cors = corsHeaders(request);
+
+  const { error: authError } = requireAuth(request);
+  if (authError) return json({ error: authError }, 401, cors);
+
+  if (!env.AZURE_TTS_KEY || !env.AZURE_TTS_REGION) {
+    return json({ error: "Azure TTS not configured on this server" }, 503, cors);
+  }
+
+  let body;
+  try { body = await request.json(); }
+  catch { return json({ error: "Invalid JSON body" }, 400, cors); }
+
+  const { text, lang = "de" } = body;
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return json({ error: "text is required" }, 400, cors);
+  }
+
+  const voice = AZURE_VOICES[lang] ?? AZURE_VOICES.de;
+  const locale = AZURE_LOCALES[lang] ?? AZURE_LOCALES.de;
+  const safeText = escapeXml(text.slice(0, 10000));
+  const ssml = `<speak version='1.0' xml:lang='${locale}'><voice name='${voice}'>${safeText}</voice></speak>`;
+
+  return fetchAndStreamAzureAudio(ssml, env, cors);
+}
+
+async function fetchAndStreamAzureAudio(ssml, env, cors) {
+  let azureRes;
+  try {
+    azureRes = await fetch(
+      `https://${env.AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`,
+      {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": env.AZURE_TTS_KEY,
+          "Content-Type": "application/ssml+xml",
+          "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        },
+        body: ssml,
+      },
+    );
+  } catch (err) {
+    return json({ error: "Azure TTS request failed", detail: String(err) }, 502, cors);
+  }
+
+  if (!azureRes.ok) {
+    const detail = await azureRes.text().catch(() => "(unreadable)");
+    return json({ error: "Azure TTS error", status: azureRes.status, detail }, 502, cors);
+  }
+
+  const audioBuffer = await azureRes.arrayBuffer();
+  return new Response(audioBuffer, {
+    status: 200,
+    headers: { "Content-Type": "audio/mpeg", "Content-Disposition": 'inline; filename="tts.mp3"', ...cors },
+  });
+}
+
 // ─── DeepL Translation ────────────────────────────────────────────────────────
 
 const DEEPL_LANGS = { fa: "FA", de: "DE", en: "EN-GB" };
@@ -1123,62 +1195,33 @@ Return ONLY valid JSON, no markdown, no explanation:
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
+// Dispatch table maps "METHOD /path" → handler(request, env, url).
+// Reduces cognitive complexity of the main fetch handler to O(1) lookup.
+const ROUTES = {
+  "GET /health":          (req, env, _url) => json({ ok: true, service: "dailyflow-ai-worker" }, 200, corsHeaders(req)),
+  "POST /analyze":        (req, env) => handleAnalyze(req, env),
+  "GET /search":          (req, env, url) => handleSearch(req, env, url),
+  "POST /photos/upload":  (req, env) => handlePhotoUpload(req, env),
+  "GET /photos/file":     (req, env, url) => handlePhotoFile(req, env, url),
+  "DELETE /photos/delete":(req, env, url) => handlePhotoDelete(req, env, url),
+  "POST /photos/analyze": (req, env) => handlePhotoAnalyze(req, env),
+  "POST /translate":      (req, env) => handleTranslate(req, env),
+  "POST /ocr":            (req, env) => handleOcr(req, env),
+  "POST /tts":            (req, env) => handleTts(req, env),
+  "POST /tts-azure":      (req, env) => handleTtsAzure(req, env),
+  "POST /briefing":       (req, env) => handleBriefing(req, env),
+  "POST /import-bank":    (req, env) => handleImportBank(req, env),
+};
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const { pathname } = url;
-
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
-    if (pathname === "/health" && request.method === "GET") {
-      return json({ ok: true, service: "dailyflow-ai-worker" }, 200, corsHeaders(request));
-    }
-
-    if (pathname === "/analyze" && request.method === "POST") {
-      return handleAnalyze(request, env);
-    }
-
-    if (pathname === "/search" && request.method === "GET") {
-      return handleSearch(request, env, url);
-    }
-
-    if (pathname === "/photos/upload" && request.method === "POST") {
-      return handlePhotoUpload(request, env);
-    }
-
-    if (pathname === "/photos/file" && request.method === "GET") {
-      return handlePhotoFile(request, env, url);
-    }
-
-    if (pathname === "/photos/delete" && request.method === "DELETE") {
-      return handlePhotoDelete(request, env, url);
-    }
-
-    if (pathname === "/photos/analyze" && request.method === "POST") {
-      return handlePhotoAnalyze(request, env);
-    }
-
-    if (pathname === "/translate" && request.method === "POST") {
-      return handleTranslate(request, env);
-    }
-
-    if (pathname === "/ocr" && request.method === "POST") {
-      return handleOcr(request, env);
-    }
-
-    if (pathname === "/tts" && request.method === "POST") {
-      return handleTts(request, env);
-    }
-
-    if (pathname === "/briefing" && request.method === "POST") {
-      return handleBriefing(request, env);
-    }
-
-    if (pathname === "/import-bank" && request.method === "POST") {
-      return handleImportBank(request, env);
-    }
+    const url = new URL(request.url);
+    const handler = ROUTES[`${request.method} ${url.pathname}`];
+    if (handler) return handler(request, env, url);
 
     return json({ error: "Not found" }, 404, corsHeaders(request));
   },
