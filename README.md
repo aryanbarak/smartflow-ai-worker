@@ -1,8 +1,7 @@
 <div align="center">
 
-# dailyflow-ai-worker
-
-**Cloudflare Worker — secure AI proxy for DailyFlow**
+# smartflow-ai-worker
+**Cloudflare Worker — secure AI proxy for SmartFlow**
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![JavaScript](https://img.shields.io/badge/JavaScript-ES2022-F7DF1E?style=for-the-badge&logo=javascript&logoColor=black)](https://developer.mozilla.org/en-US/docs/Web/JavaScript)
@@ -15,9 +14,9 @@
 
 ## Overview
 
-This worker connects the [DailyFlow](https://github.com/aryanbarak/dailyflow) frontend with Google Gemini AI. It acts as a secure serverless proxy — handling authentication, CORS, rate limiting and Gemini API communication so the API key is never exposed in the browser.
+This worker connects the [SmartFlow](https://github.com/aryanbarak/smartflow) frontend with Google Gemini AI. It acts as a secure serverless proxy — handling authentication, CORS, rate limiting and Gemini API communication so the API key is never exposed in the browser.
 
-**Live app:** https://barakzai.cloud · **Main repo:** [aryanbarak/dailyflow](https://github.com/aryanbarak/dailyflow)
+**Live app:** https://barakzai.cloud · **Main repo:** [aryanbarak/smartflow](https://github.com/aryanbarak/smartflow)
 
 ---
 
@@ -33,35 +32,14 @@ This worker connects the [DailyFlow](https://github.com/aryanbarak/dailyflow) fr
 
 ---
 
-## Request / Response
-
-**Request**
-```json
-{
-  "message": "Explain database normalization in simple terms",
-  "conversation": []
-}
-```
-
-**Response**
-```json
-{
-  "answer": "Database normalization is a way to organize data..."
-}
-```
-
----
-
 ## Security
-
-The Gemini API key is never exposed to the browser. All requests go through this worker which enforces:
 
 | Measure | Implementation |
 |---------|----------------|
 | API key isolation | Stored in Cloudflare Worker secrets only |
 | User authentication | JWT validation on every protected endpoint |
 | Rate limiting | Per-user request counter via Cloudflare KV |
-| Origin restriction | CORS whitelist for DailyFlow frontend only |
+| Origin restriction | CORS whitelist for SmartFlow frontend only |
 
 ---
 
@@ -78,25 +56,7 @@ The Gemini API key is never exposed to the browser. All requests go through this
 
 ---
 
-## Deployment
-
-```bash
-# Install Wrangler
-npm install -g wrangler
-
-# Authenticate
-wrangler login
-
-# Set Gemini API key as secret
-wrangler secret put GEMINI_API_KEY
-
-# Deploy
-wrangler deploy
-```
-
----
-
-## Powers these DailyFlow features
+## Powers these SmartFlow features
 
 - AI Learning Assistant
 - Weekly Life Briefing
