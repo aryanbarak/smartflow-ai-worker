@@ -954,106 +954,6 @@ async function handleTranslate(request, env) {
   }
 }
 
-// ─── Weekly Briefing ─────────────────────────────────────────────────────────
-
-async function handleBriefing(request, env) {
-  const cors = corsHeaders(request);
-
-  const { error: authError } = requireAuth(request);
-  if (authError) return json({ error: authError }, 401, cors);
-
-  const identifier = getIdentifier(request);
-  const rl = await checkRateLimit(env, identifier, "briefing", 5);
-  if (!rl.allowed) {
-    return json({ error: "Rate limit exceeded. Max 5 briefings per hour." }, 429, {
-      ...cors, "Retry-After": "3600",
-    });
-  }
-
-  let body;
-  try { body = await request.json(); }
-  catch { return json({ error: "Invalid JSON body" }, 400, cors); }
-
-  if (!env.GEMINI_API_KEY) {
-    return json({ error: "GEMINI_API_KEY is not configured" }, 500, cors);
-  }
-
-  const { data, language = "en", memoryContext = "" } = body;
-  const langInstructions = {
-    en: "Respond in English.",
-    de: "Antworte auf Deutsch.",
-    fa: "به فارسی پاسخ بده. از اعداد فارسی استفاده نکن.",
-  };
-
-  const prompt = `You are a personal life assistant analyzing weekly data for the user.
-${langInstructions[language] ?? langInstructions.en}${memoryContext ? `\n${memoryContext}` : ""}
-
-Here is the user's data for this week:
-
-TASKS:
-- Overdue: ${data.tasks.overdue.length} tasks
-${data.tasks.overdue.slice(0, 5).map(t => `  • ${t.title} (due: ${t.due_date})`).join("\n")}
-- Due this week: ${data.tasks.dueThisWeek.length} tasks
-${data.tasks.dueThisWeek.slice(0, 5).map(t => `  • ${t.title} (due: ${t.due_date})`).join("\n")}
-
-CALENDAR EVENTS THIS WEEK:
-${data.calendar.slice(0, 7).map(e => `  • ${e.title} — ${e.date}${e.start_time ? " at " + e.start_time : ""}`).join("\n") || "  No events"}
-
-HABITS (last 7 days):
-${data.habits.map(h => `  • ${h.title}: ${h.completions}/${h.target} days completed`).join("\n") || "  No habits tracked"}
-
-JOURNAL & MOOD (last 7 days):
-- Average mood: ${data.journal.avgMood}/5
-- Entries written: ${data.journal.entryCount}
-${data.journal.lastEntry ? `- Last entry preview: "${data.journal.lastEntry.slice(0, 100)}..."` : ""}
-
-FINANCE (last 30 days):
-- Total income: ${data.finance.totalIncome} EUR
-- Total expenses: ${data.finance.totalExpenses} EUR
-- Balance: ${data.finance.balance} EUR
-- Top expense categories: ${data.finance.topCategories.join(", ")}
-
-FAMILY EVENTS THIS WEEK:
-${data.family.slice(0, 5).map(e => `  • ${e}`).join("\n") || "  No family events"}
-
-Please provide a structured weekly briefing with these EXACT sections.
-Use markdown formatting. Be concise but insightful. Maximum 400 words total.
-
-## 📋 This Week's Focus
-[2-3 most important things to focus on based on the data]
-
-## 🚨 Urgent & Overdue
-[Tasks that need immediate attention]
-
-## 📅 Coming Up
-[Key events and deadlines this week]
-
-## 💰 Financial Snapshot
-[Brief financial summary and any concerns]
-
-## ❤️ Wellbeing & Family
-[Mood trend, habit performance, family highlights]
-
-## 💡 Recommendations
-[3 specific actionable recommendations for this week]`;
-
-  try {
-    const result = await callGeminiWithFallback( // NOSONAR
-      { contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 2048, temperature: 0.7, thinkingConfig: { thinkingBudget: 0 } } },
-      env.GEMINI_API_KEY,
-      env,
-    );
-    const geminiData = await result.res.json();
-    const briefing = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-    return json({ briefing, provider: result.provider, generatedAt: new Date().toISOString() }, 200, {
-      ...cors,
-      "X-AI-Provider": result.provider,
-    });
-  } catch (err) {
-    return json({ error: err.message ?? "Briefing generation failed" }, 502, cors);
-  }
-}
-
 // ─── Import Bank Statement ────────────────────────────────────────────────────
 
 async function handleImportBank(request, env) {
@@ -1198,7 +1098,7 @@ Return ONLY valid JSON, no markdown, no explanation:
 // Dispatch table maps "METHOD /path" → handler(request, env, url).
 // Reduces cognitive complexity of the main fetch handler to O(1) lookup.
 const ROUTES = {
-  "GET /health":          (req, env, _url) => json({ ok: true, service: "dailyflow-ai-worker" }, 200, corsHeaders(req)),
+  "GET /health":          (req, env, _url) => json({ ok: true, service: "smartflow-ai-worker" }, 200, corsHeaders(req)),
   "POST /analyze":        (req, env) => handleAnalyze(req, env),
   "GET /search":          (req, env, url) => handleSearch(req, env, url),
   "POST /photos/upload":  (req, env) => handlePhotoUpload(req, env),
@@ -1209,7 +1109,6 @@ const ROUTES = {
   "POST /ocr":            (req, env) => handleOcr(req, env),
   "POST /tts":            (req, env) => handleTts(req, env),
   "POST /tts-azure":      (req, env) => handleTtsAzure(req, env),
-  "POST /briefing":       (req, env) => handleBriefing(req, env),
   "POST /import-bank":    (req, env) => handleImportBank(req, env),
 };
 

@@ -42,9 +42,5 @@ pattern = "api.barakzai.cloud/tts-azure"
 zone_name = "barakzai.cloud"
 
 [[routes]]
-pattern = "api.barakzai.cloud/briefing"
-zone_name = "barakzai.cloud"
-
-[[routes]]
 pattern = "api.barakzai.cloud/import-bank"
 zone_name = "barakzai.cloud"
